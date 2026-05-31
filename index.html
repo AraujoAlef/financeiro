@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Controle Financeiro</title>
+  <title>FinControl Pro — Alef</title>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
@@ -1268,7 +1268,8 @@ const buildClassificationContext = (mem) => {
 
 function FaturaImport({ people, onImportTransactions, classificationMemory, onSaveMemory }) {
   const [step, setStep] = useState('upload');
-  const [file, setFile] = useState(null);
+  const [files, setFiles] = useState([]);          // supports multiple images
+  const [inputMode, setInputMode] = useState('pdf'); // 'pdf' | 'image' | 'csv'
   const [cardName, setCardName] = useState('');
   const [apiKey, setApiKey] = useState(() => load('fin_apikey', ''));
   const [items, setItems] = useState([]);
@@ -1277,28 +1278,56 @@ function FaturaImport({ people, onImportTransactions, classificationMemory, onSa
   const [dragOver, setDragOver] = useState(false);
   const [progress, setProgress] = useState('');
   const [showKey, setShowKey] = useState(false);
+  const [previews, setPreviews] = useState([]);    // image preview URLs
 
   const saveApiKey = (k) => { setApiKey(k); save('fin_apikey', k); };
 
-  const handleFile = (f) => {
-    if (!f || f.type !== 'application/pdf') { setError('Envie um arquivo PDF.'); return; }
-    setFile(f); setError('');
+  const IMAGE_TYPES = ['image/jpeg','image/jpg','image/png','image/webp','image/gif'];
+
+  const handleFiles = (fileList) => {
+    const arr = Array.from(fileList);
+    if (inputMode === 'pdf') {
+      const f = arr[0];
+      if (!f || f.type !== 'application/pdf') { setError('Envie um arquivo PDF.'); return; }
+      setFiles([f]); setPreviews([]); setError('');
+    } else if (inputMode === 'csv') {
+      const f = arr[0];
+      if (!f || (!f.name.endsWith('.csv') && f.type !== 'text/csv')) { setError('Envie um arquivo .CSV.'); return; }
+      setFiles([f]); setPreviews([]); setError('');
+    } else {
+      const imgs = arr.filter(f => IMAGE_TYPES.includes(f.type));
+      if (!imgs.length) { setError('Envie imagens JPG, PNG ou WebP.'); return; }
+      setFiles(prev => [...prev, ...imgs]);
+      imgs.forEach(f => {
+        const reader = new FileReader();
+        reader.onload = e => setPreviews(prev => [...prev, { name: f.name, url: e.target.result }]);
+        reader.readAsDataURL(f);
+      });
+      setError('');
+    }
+  };
+
+  const removeFile = (idx) => {
+    setFiles(prev => prev.filter((_,i) => i !== idx));
+    setPreviews(prev => prev.filter((_,i) => i !== idx));
   };
 
   const handleDrop = (e) => {
     e.preventDefault(); setDragOver(false);
-    handleFile(e.dataTransfer.files[0]);
+    handleFiles(e.dataTransfer.files);
+  };
+
+  const switchMode = (mode) => {
+    setInputMode(mode); setFiles([]); setPreviews([]); setError('');
   };
 
   const processInvoice = async () => {
-    if (!file) return setError('Selecione um PDF.');
+    if (!files.length) return setError(inputMode === 'pdf' ? 'Selecione um PDF.' : inputMode === 'csv' ? 'Selecione um arquivo CSV.' : 'Adicione ao menos um print.');
     if (!apiKey) return setError('Informe sua chave de API Anthropic.');
-    setProcessing(true); setError(''); setProgress('Lendo o PDF...');
+    setProcessing(true); setError(''); setProgress('Preparando arquivo...');
     try {
-      const base64 = await fileToBase64(file);
       const ctx = buildClassificationContext(classificationMemory);
       const peopleList = people.map(p => p.id + ':' + p.name).join(', ');
-      setProgress('Enviando para IA extrair lancamentos...');
 
       const systemPrompt = `Voce e um assistente especializado em extrair e classificar lancamentos de faturas de cartao de credito brasileiras.
 
@@ -1311,12 +1340,124 @@ Retorne SOMENTE JSON valido sem markdown:
 {"items":[{"description":"nome exato do estabelecimento","amount":0.00,"date":"YYYY-MM-DD","installment":"1/10 ou null","category":"categoria","module":"personal|family|agency","personId":"id ou null","confidence":"high|medium|low","reason":"motivo breve"}]}
 
 Regras:
-- Extraia TODOS os lancamentos, inclusive parcelas
+- Extraia TODOS os lancamentos visiveis, inclusive parcelas
 - Para parcelas inclua o numero no campo installment ex: "3/10"
 - Valores como numero float sem R$
+- Se for print parcial, extraia apenas o que estiver visivel
 - Use historico para sugerir module e personId automaticamente
 - confidence high=encontrou no historico, medium=inferiu pelo tipo, low=novo`;
 
+      // ---- CSV: parse locally, no AI needed ----
+      if (inputMode === 'csv') {
+        setProgress('Lendo CSV...');
+        const text = await files[0].text();
+        const lines = text.split(/\r?\n/).filter(l => l.trim());
+        if (!lines.length) throw new Error('Arquivo CSV vazio.');
+
+        // Detect separator
+        const sep = lines[0].includes(';') ? ';' : ',';
+
+        // Parse header
+        const headers = lines[0].split(sep).map(h => h.replace(/^["']|["']$/g,'').trim().toLowerCase());
+
+        // Column mapping — handles common Brazilian bank CSV exports
+        const colMap = {
+          date:   headers.findIndex(h => /data|date/.test(h)),
+          desc:   headers.findIndex(h => /descri|estabele|hist|lancamento|title|name|merchant/.test(h)),
+          amount: headers.findIndex(h => /valor|amount|value|total/.test(h)),
+          inst:   headers.findIndex(h => /parcela|installment/.test(h)),
+          cat:    headers.findIndex(h => /categ/.test(h)),
+        };
+
+        const parseAmt = (v) => {
+          if (!v) return 0;
+          // Remove currency symbols and spaces, handle Brazilian format (1.234,56 or 1234.56)
+          let s = v.toString().replace(/[R$\s]/g,'').trim();
+          // If both . and , present: . is thousands separator, , is decimal
+          if (s.includes('.') && s.includes(',')) s = s.replace(/\./g,'').replace(',','.');
+          else if (s.includes(',')) s = s.replace(',','.');
+          return Math.abs(parseFloat(s)) || 0;
+        };
+
+        const parseDate = (v) => {
+          if (!v) return todayStr();
+          v = v.replace(/["']/g,'').trim();
+          // DD/MM/YYYY
+          if (/^\d{2}\/\d{2}\/\d{4}$/.test(v)) {
+            const [d,m,y] = v.split('/'); return y+'-'+m+'-'+d;
+          }
+          // YYYY-MM-DD already
+          if (/^\d{4}-\d{2}-\d{2}$/.test(v)) return v;
+          // DD-MM-YYYY
+          if (/^\d{2}-\d{2}-\d{4}$/.test(v)) {
+            const [d,m,y] = v.split('-'); return y+'-'+m+'-'+d;
+          }
+          return todayStr();
+        };
+
+        const getCell = (row, idx) => idx >= 0 && idx < row.length ? row[idx].replace(/^["']|["']$/g,'').trim() : '';
+
+        const enriched = [];
+        for (let i = 1; i < lines.length; i++) {
+          const row = lines[i].split(sep);
+          const desc = colMap.desc >= 0 ? getCell(row, colMap.desc) : '';
+          const rawAmt = colMap.amount >= 0 ? getCell(row, colMap.amount) : '';
+          const amount = parseAmt(rawAmt);
+          if (!desc || !amount) continue;
+
+          const date = parseDate(colMap.date >= 0 ? getCell(row, colMap.date) : '');
+          const installment = colMap.inst >= 0 ? getCell(row, colMap.inst) || null : null;
+          const csvCat = colMap.cat >= 0 ? getCell(row, colMap.cat) : '';
+
+          // Check memory for classification suggestion
+          const key = desc.toLowerCase().trim().slice(0,50);
+          const mem = classificationMemory[key];
+          const confidence = mem ? 'high' : 'low';
+          const module = mem ? (mem.module || 'personal') : 'personal';
+          const personId = mem ? (mem.personId || null) : null;
+          const category = mem ? mem.category : (csvCat || 'Outro');
+
+          enriched.push({
+            id: uid(), description: desc, amount, date,
+            installment: installment || null,
+            category, module, personId,
+            type: 'expense', paymentMethod: 'Cartao de Credito',
+            status: 'paid', month: date.slice(0,7),
+            cardLabel: cardName || '', approved: false,
+            confidence, reason: mem ? 'Encontrado no historico' : (csvCat ? 'Categoria do CSV' : 'Novo lancamento'),
+          });
+        }
+
+        if (!enriched.length) throw new Error('Nenhum lancamento encontrado no CSV. Verifique o formato do arquivo.');
+        setItems(enriched); setStep('review');
+        setProcessing(false); setProgress('');
+        return;
+      }
+
+      setProgress('Enviando para IA...');
+      let messageContent = [];
+
+      if (inputMode === 'pdf') {
+        const base64 = await fileToBase64(files[0]);
+        messageContent = [
+          { type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: base64 } },
+          { type: 'text', text: 'Extraia todos os lancamentos desta fatura' + (cardName ? ' do ' + cardName : '') + '. Retorne apenas o JSON.' }
+        ];
+      } else {
+        // Multiple images — send all, then ask for JSON
+        for (let i = 0; i < files.length; i++) {
+          setProgress(`Processando imagem ${i+1} de ${files.length}...`);
+          const base64 = await fileToBase64(files[i]);
+          const mime = files[i].type || 'image/jpeg';
+          messageContent.push({ type: 'image', source: { type: 'base64', media_type: mime, data: base64 } });
+        }
+        const imgDesc = files.length > 1
+          ? `Estas ${files.length} imagens sao prints de tela de uma fatura` + (cardName ? ' do ' + cardName : '') + '. Extraia todos os lancamentos visiveis em todas as imagens e retorne apenas o JSON consolidado.'
+          : 'Este print de tela mostra lancamentos de fatura' + (cardName ? ' do ' + cardName : '') + '. Extraia todos os lancamentos visiveis e retorne apenas o JSON.';
+        messageContent.push({ type: 'text', text: imgDesc });
+      }
+
+      setProgress('Aguardando resposta da IA...');
       const response = await fetch('https://api.anthropic.com/v1/messages', {
         method: 'POST',
         headers: {
@@ -1329,10 +1470,7 @@ Regras:
           model: 'claude-sonnet-4-5',
           max_tokens: 4000,
           system: systemPrompt,
-          messages: [{ role: 'user', content: [
-            { type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: base64 } },
-            { type: 'text', text: 'Extraia todos os lancamentos desta fatura' + (cardName ? ' do ' + cardName : '') + '. Retorne apenas o JSON.' }
-          ]}],
+          messages: [{ role: 'user', content: messageContent }],
         })
       });
 
@@ -1376,7 +1514,7 @@ Regras:
     setStep('done');
   };
 
-  const reset = () => { setStep('upload'); setFile(null); setItems([]); setError(''); };
+  const reset = () => { setStep('upload'); setFiles([]); setPreviews([]); setItems([]); setError(''); };
   const cfColor = { high:'#16a34a', medium:'#d97706', low:'#94a3b8' };
   const cfLabel = { high:'Aprendido', medium:'Inferido', low:'Novo' };
   const cfEmoji = { high:'✅', medium:'🔍', low:'❓' };
@@ -1389,8 +1527,11 @@ Regras:
       <div className="section-card" style={{textAlign:'center',padding:60}}>
         <div style={{fontSize:56,marginBottom:16}}>🎉</div>
         <div style={{fontFamily:'Syne',fontSize:24,fontWeight:700,marginBottom:8}}>{approved.length} lancamentos importados!</div>
-        <div style={{color:'var(--muted)',marginBottom:32}}>A IA aprendeu as classificacoes e vai sugerir automaticamente na proxima fatura.</div>
-        <button className="btn btn-primary" onClick={reset}>📄 Importar outra fatura</button>
+        <div style={{color:'var(--muted)',marginBottom:32}}>A IA aprendeu as classificacoes e vai sugerir automaticamente na proxima vez.</div>
+        <div style={{display:'flex',gap:12,justifyContent:'center'}}>
+          <button className="btn btn-primary" onClick={reset}>📄 Importar outra fatura</button>
+          <button className="btn btn-ghost" onClick={()=>{ reset(); }}>📊 Ver Dashboard</button>
+        </div>
       </div>
     </div>
   );
@@ -1491,64 +1632,210 @@ Regras:
     </div>
   );
 
-  // STEP: UPLOAD
+  // ---- UPLOAD STEP ----
+  const inputId = inputMode === 'pdf' ? 'file-input-pdf' : inputMode === 'csv' ? 'file-input-csv' : 'file-input-img';
+  const acceptStr = inputMode === 'pdf' ? 'application/pdf' : inputMode === 'csv' ? '.csv,text/csv' : 'image/jpeg,image/jpg,image/png,image/webp';
+  const hasFiles = files.length > 0;
+
   return (
     <div className="page">
-      <div style={{maxWidth:620,margin:'0 auto'}}>
+      <div style={{maxWidth:640,margin:'0 auto'}}>
 
-        <div className="section-card" style={{marginBottom:20}}>
+        {/* API KEY — hidden for CSV */}
+        {inputMode !== 'csv' && <div className="section-card" style={{marginBottom:20}}>
           <div className="section-header">
             <span className="section-title">🔑 Chave de API Anthropic</span>
-            {apiKey && <span style={{fontSize:12,color:'var(--success)',fontWeight:600}}>✅ Configurada</span>}
+            {apiKey && <span style={{fontSize:12,color:'var(--success)',fontWeight:600,background:'#dcfce7',padding:'3px 10px',borderRadius:20}}>✅ Configurada</span>}
           </div>
           <div style={{padding:'16px 24px'}}>
             <div style={{fontSize:13,color:'var(--muted)',marginBottom:10}}>
-              Necessaria para a IA ler e classificar a fatura. Fica salva localmente no seu navegador.
+              Necessaria para a IA ler e classificar. Salva localmente no navegador.
               <a href="https://console.anthropic.com/settings/keys" target="_blank" rel="noreferrer"
                 style={{color:'var(--accent)',marginLeft:6,textDecoration:'none',fontWeight:600}}>Obter chave →</a>
             </div>
             <div style={{display:'flex',gap:8}}>
               <input className="form-control" type={showKey?'text':'password'} placeholder="sk-ant-api03-..."
                 value={apiKey} onChange={e => saveApiKey(e.target.value)} style={{flex:1}} />
-              <button className="btn btn-ghost btn-sm" onClick={() => setShowKey(s => !s)}
-                style={{flexShrink:0}}>{showKey?'🙈 Ocultar':'👁️ Ver'}</button>
+              <button className="btn btn-ghost btn-sm" onClick={() => setShowKey(s => !s)} style={{flexShrink:0}}>
+                {showKey ? '🙈 Ocultar' : '👁️ Ver'}
+              </button>
             </div>
           </div>
-        </div>
+        </div>}
 
+        {/* CARD NAME */}
         <div className="section-card" style={{marginBottom:20}}>
           <div className="section-header"><span className="section-title">💳 Cartao de Credito</span></div>
           <div style={{padding:'16px 24px'}}>
-            <input className="form-control" placeholder="Ex: Nubank, Santander Gold, Itau Personnalite, XP, C6..."
+            <input className="form-control" placeholder="Ex: Nubank, Santander, Itau, XP, C6..."
               value={cardName} onChange={e => setCardName(e.target.value)} />
-            <div style={{fontSize:12,color:'var(--muted)',marginTop:6}}>
-              Nomear o cartao ajuda a IA a interpretar o formato correto da fatura
+            <div style={{fontSize:12,color:'var(--muted)',marginTop:6}}>Identifica o cartao para a IA interpretar corretamente</div>
+          </div>
+        </div>
+
+        {/* MODE TOGGLE */}
+        <div className="section-card" style={{marginBottom:20}}>
+          <div className="section-header"><span className="section-title">📂 Tipo de Arquivo</span></div>
+          <div style={{padding:'16px 24px'}}>
+            <div style={{display:'grid',gridTemplateColumns:'1fr 1fr 1fr',gap:12}}>
+
+              {/* PDF option */}
+              <div onClick={() => switchMode('pdf')} style={{
+                border: '2px solid ' + (inputMode==='pdf' ? 'var(--accent)' : 'var(--border)'),
+                borderRadius:12, padding:'20px 16px', cursor:'pointer', textAlign:'center',
+                background: inputMode==='pdf' ? 'rgba(37,99,235,0.06)' : '#fafbfc',
+                transition:'all 0.2s',
+              }}>
+                <div style={{fontSize:32,marginBottom:8}}>📄</div>
+                <div style={{fontFamily:'Syne',fontWeight:700,fontSize:14,
+                  color:inputMode==='pdf'?'var(--accent)':'var(--text)'}}>Fatura PDF</div>
+                <div style={{fontSize:12,color:'var(--muted)',marginTop:4,lineHeight:1.4}}>
+                  Fatura fechada do banco em PDF
+                </div>
+              </div>
+
+              {/* Image/print option */}
+              <div onClick={() => switchMode('image')} style={{
+                border: '2px solid ' + (inputMode==='image' ? 'var(--accent)' : 'var(--border)'),
+                borderRadius:12, padding:'20px 16px', cursor:'pointer', textAlign:'center',
+                background: inputMode==='image' ? 'rgba(37,99,235,0.06)' : '#fafbfc',
+                transition:'all 0.2s',
+              }}>
+                <div style={{fontSize:32,marginBottom:8}}>📱</div>
+                <div style={{fontFamily:'Syne',fontWeight:700,fontSize:14,
+                  color:inputMode==='image'?'var(--accent)':'var(--text)'}}>Print / Screenshot</div>
+                <div style={{fontSize:12,color:'var(--muted)',marginTop:4,lineHeight:1.4}}>
+                  Print do app do banco · Fatura ainda aberta · Varios prints
+                </div>
+              </div>
+
+              {/* CSV option */}
+              <div onClick={() => switchMode('csv')} style={{
+                border: '2px solid ' + (inputMode==='csv' ? 'var(--accent)' : 'var(--border)'),
+                borderRadius:12, padding:'20px 16px', cursor:'pointer', textAlign:'center',
+                background: inputMode==='csv' ? 'rgba(37,99,235,0.06)' : '#fafbfc',
+                transition:'all 0.2s',
+              }}>
+                <div style={{fontSize:32,marginBottom:8}}>📊</div>
+                <div style={{fontFamily:'Syne',fontWeight:700,fontSize:14,
+                  color:inputMode==='csv'?'var(--accent)':'var(--text)'}}>Planilha CSV</div>
+                <div style={{fontSize:12,color:'var(--muted)',marginTop:4,lineHeight:1.4}}>
+                  Exportado do banco · Sem IA · Processamento instantaneo
+                </div>
+              </div>
             </div>
           </div>
         </div>
 
+        {/* DROP ZONE */}
         <div
           onDragOver={e => { e.preventDefault(); setDragOver(true); }}
           onDragLeave={() => setDragOver(false)}
           onDrop={handleDrop}
-          onClick={() => document.getElementById('pdf-input').click()}
+          onClick={() => !hasFiles && document.getElementById(inputId).click()}
           style={{
-            border: '2px dashed ' + (dragOver ? 'var(--accent)' : file ? 'var(--success)' : '#cbd5e1'),
-            borderRadius:14, padding:'52px 24px', textAlign:'center', cursor:'pointer',
-            background: dragOver ? 'rgba(37,99,235,0.04)' : file ? 'rgba(22,163,74,0.04)' : '#fafbfc',
+            border: '2px dashed ' + (dragOver ? 'var(--accent)' : hasFiles ? 'var(--success)' : '#cbd5e1'),
+            borderRadius:14, padding: hasFiles && inputMode==='image' ? '20px' : '48px 24px',
+            textAlign:'center', cursor: hasFiles && inputMode==='image' ? 'default' : 'pointer',
+            background: dragOver ? 'rgba(37,99,235,0.04)' : hasFiles ? 'rgba(22,163,74,0.03)' : '#fafbfc',
             transition:'all 0.2s', marginBottom:20,
           }}>
-          <input id="pdf-input" type="file" accept="application/pdf" style={{display:'none'}}
-            onChange={e => handleFile(e.target.files[0])} />
-          <div style={{fontSize:44,marginBottom:12}}>{file ? '✅' : '📄'}</div>
-          {file
-            ? <><div style={{fontFamily:'Syne',fontSize:16,fontWeight:700,color:'var(--success)'}}>{file.name}</div>
-                <div style={{fontSize:13,color:'var(--muted)',marginTop:4}}>{(file.size/1024).toFixed(0)} KB · Clique para trocar o arquivo</div></>
-            : <><div style={{fontFamily:'Syne',fontSize:17,fontWeight:700}}>Arraste a fatura em PDF aqui</div>
-                <div style={{fontSize:13,color:'var(--muted)',marginTop:6}}>ou clique para selecionar · Nubank, Santander, Itau, XP, C6, BB...</div></>
-          }
+          <input id={inputId} type="file" accept={acceptStr}
+            multiple={inputMode==='image'} style={{display:'none'}}
+            onChange={e => handleFiles(e.target.files)} />
+
+          {/* CSV mode */}
+          {inputMode === 'csv' && (
+            hasFiles
+              ? <><div style={{fontSize:40,marginBottom:8}}>✅</div>
+                  <div style={{fontFamily:'Syne',fontSize:15,fontWeight:700,color:'var(--success)'}}>{files[0].name}</div>
+                  <div style={{fontSize:12,color:'var(--muted)',marginTop:4}}>{(files[0].size/1024).toFixed(1)} KB
+                    <button onClick={e=>{e.stopPropagation();setFiles([]);}} style={{marginLeft:10,background:'none',border:'none',color:'var(--danger)',cursor:'pointer',fontSize:12}}>✕ Trocar</button>
+                  </div></>
+              : <><div style={{fontSize:42,marginBottom:10}}>📊</div>
+                  <div style={{fontFamily:'Syne',fontSize:16,fontWeight:700}}>Arraste o CSV aqui</div>
+                  <div style={{fontSize:13,color:'var(--muted)',marginTop:6}}>ou clique para selecionar · arquivo .csv exportado do banco</div></>
+          )}
+
+          {/* PDF mode */}
+          {inputMode === 'pdf' && (
+            hasFiles
+              ? <><div style={{fontSize:40,marginBottom:8}}>✅</div>
+                  <div style={{fontFamily:'Syne',fontSize:15,fontWeight:700,color:'var(--success)'}}>{files[0].name}</div>
+                  <div style={{fontSize:12,color:'var(--muted)',marginTop:4}}>{(files[0].size/1024).toFixed(0)} KB
+                    <button onClick={e=>{e.stopPropagation();setFiles([]);}} style={{marginLeft:10,background:'none',border:'none',color:'var(--danger)',cursor:'pointer',fontSize:12}}>✕ Trocar</button>
+                  </div></>
+              : <><div style={{fontSize:42,marginBottom:10}}>📄</div>
+                  <div style={{fontFamily:'Syne',fontSize:16,fontWeight:700}}>Arraste o PDF aqui</div>
+                  <div style={{fontSize:13,color:'var(--muted)',marginTop:6}}>ou clique para selecionar</div></>
+          )}
+
+          {/* Image mode */}
+          {inputMode === 'image' && (
+            <>
+              {previews.length > 0 && (
+                <div style={{display:'flex',flexWrap:'wrap',gap:10,marginBottom:previews.length?12:0,justifyContent:'center'}}>
+                  {previews.map((p,i) => (
+                    <div key={i} style={{position:'relative',display:'inline-block'}}>
+                      <img src={p.url} alt={p.name}
+                        style={{width:110,height:80,objectFit:'cover',borderRadius:8,
+                          border:'2px solid var(--border)',display:'block'}} />
+                      <button onClick={e=>{e.stopPropagation();removeFile(i);}}
+                        style={{position:'absolute',top:-6,right:-6,background:'var(--danger)',color:'#fff',
+                          border:'none',borderRadius:'50%',width:20,height:20,fontSize:11,cursor:'pointer',
+                          display:'flex',alignItems:'center',justifyContent:'center',lineHeight:1}}>✕</button>
+                      <div style={{fontSize:10,color:'var(--muted)',marginTop:3,maxWidth:110,
+                        overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{p.name}</div>
+                    </div>
+                  ))}
+                  {/* Add more button */}
+                  <div onClick={e=>{e.stopPropagation();document.getElementById(inputId).click();}}
+                    style={{width:110,height:80,border:'2px dashed #cbd5e1',borderRadius:8,
+                      display:'flex',flexDirection:'column',alignItems:'center',justifyContent:'center',
+                      cursor:'pointer',color:'var(--muted)',fontSize:11,gap:4,background:'#f8fafc'}}>
+                    <span style={{fontSize:22}}>➕</span>
+                    <span>Adicionar</span>
+                  </div>
+                </div>
+              )}
+              {previews.length === 0 && (
+                <>
+                  <div style={{fontSize:42,marginBottom:10}}>📱</div>
+                  <div style={{fontFamily:'Syne',fontSize:16,fontWeight:700}}>Arraste os prints aqui</div>
+                  <div style={{fontSize:13,color:'var(--muted)',marginTop:6}}>
+                    JPG, PNG ou WebP · Pode adicionar varios prints de uma vez
+                  </div>
+                  <div style={{fontSize:12,color:'var(--accent)',marginTop:8,fontWeight:600}}>
+                    Fatura ainda aberta? Tire prints de cada pagina do app do banco
+                  </div>
+                </>
+              )}
+            </>
+          )}
         </div>
 
+        {/* IMAGE tips */}
+        {inputMode === 'image' && (
+          <div style={{background:'#fffbeb',border:'1px solid #fde68a',borderRadius:10,
+            padding:'12px 16px',marginBottom:20,fontSize:13,color:'#92400e',lineHeight:1.6}}>
+            <strong>💡 Dica para melhores resultados:</strong><br/>
+            Tire prints com boa resolucao mostrando claramente o nome do estabelecimento e o valor.
+            Se a lista for longa, tire um print por "scroll" da tela — pode adicionar varios de uma vez.
+          </div>
+        )}
+
+        {/* CSV tips */}
+        {inputMode === 'csv' && (
+          <div style={{background:'#f0fdf4',border:'1px solid #bbf7d0',borderRadius:10,
+            padding:'12px 16px',marginBottom:20,fontSize:13,color:'#14532d',lineHeight:1.6}}>
+            <strong>⚡ Processamento instantaneo — sem IA necessaria!</strong><br/>
+            Exporte o CSV direto do site do banco (Nubank, Santander, Itau, etc).
+            O sistema le automaticamente a data, descricao e valor. As classificacoes
+            do historico sao aplicadas na hora.
+          </div>
+        )}
+
+        {/* AI MEMORY */}
         {Object.keys(classificationMemory).length > 0 && (
           <div className="section-card" style={{marginBottom:20}}>
             <div className="section-header">
@@ -1557,7 +1844,7 @@ Regras:
                 {Object.keys(classificationMemory).length} estabelecimentos aprendidos
               </span>
             </div>
-            <div style={{padding:'8px 16px',maxHeight:160,overflowY:'auto'}}>
+            <div style={{padding:'8px 16px',maxHeight:150,overflowY:'auto'}}>
               {Object.entries(classificationMemory).slice(-30).reverse().map(([key,val]) => (
                 <div key={key} style={{display:'flex',justifyContent:'space-between',alignItems:'center',
                   padding:'6px 0',borderBottom:'1px solid #f1f5f9',fontSize:12}}>
@@ -1581,13 +1868,24 @@ Regras:
 
         <button className="btn btn-primary"
           style={{width:'100%',justifyContent:'center',padding:'15px',fontSize:15,borderRadius:10}}
-          onClick={processInvoice} disabled={processing || !file}>
-          {processing ? '⏳ ' + progress : '🤖 Extrair e classificar com IA'}
+          onClick={processInvoice} disabled={processing || !hasFiles}>
+          {processing
+            ? '⏳ ' + progress
+            : inputMode === 'pdf'
+              ? '🤖 Extrair lançamentos do PDF'
+              : inputMode === 'csv'
+              ? '⚡ Importar CSV'
+              : `🤖 Analisar ${files.length > 1 ? files.length + ' prints' : 'o print'} com IA`
+          }
         </button>
 
         <div style={{marginTop:16,fontSize:12,color:'var(--muted)',textAlign:'center',lineHeight:1.8}}>
-          O PDF vai direto para a API Anthropic via sua chave pessoal.<br/>
-          Nenhum dado passa por servidores externos. Privado e seguro.
+          {inputMode === 'csv'
+            ? 'O CSV e processado localmente no navegador. Nenhum dado e enviado para nenhum servidor.'
+            : inputMode === 'pdf'
+            ? 'O PDF vai direto para a API Anthropic via sua chave pessoal. Nenhum dado passa por servidores externos.'
+            : 'As imagens vao direto para a API Anthropic via sua chave pessoal. Nenhum dado passa por servidores externos.'
+          }
         </div>
       </div>
     </div>
@@ -1973,7 +2271,7 @@ function App() {
       {/* SIDEBAR */}
       <aside className="sidebar">
         <div className="sidebar-logo">
-          <div className="logo-title">Controle Financeiro Pro</div>
+          <div className="logo-title">FinControl Pro</div>
           <div className="logo-sub">controle financeiro</div>
         </div>
         <nav className="sidebar-nav">
