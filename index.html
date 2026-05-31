@@ -1349,31 +1349,17 @@ Regras:
 
       // ---- CSV: parse locally, no AI needed ----
       if (inputMode === 'csv') {
-        setProgress('Lendo CSV...');
-        const text = await files[0].text();
-        const lines = text.split(/\r?\n/).filter(l => l.trim());
-        if (!lines.length) throw new Error('Arquivo CSV vazio.');
+        setProgress('Lendo arquivo...');
 
-        // Detect separator
-        const sep = lines[0].includes(';') ? ';' : ',';
-
-        // Parse header
-        const headers = lines[0].split(sep).map(h => h.replace(/^["']|["']$/g,'').trim().toLowerCase());
-
-        // Column mapping — handles common Brazilian bank CSV exports
-        const colMap = {
-          date:   headers.findIndex(h => /data|date/.test(h)),
-          desc:   headers.findIndex(h => /descri|estabele|hist|lancamento|title|name|merchant/.test(h)),
-          amount: headers.findIndex(h => /valor|amount|value|total/.test(h)),
-          inst:   headers.findIndex(h => /parcela|installment/.test(h)),
-          cat:    headers.findIndex(h => /categ/.test(h)),
+        // Helper: detect if ArrayBuffer is a ZIP (XLSX starts with PK magic bytes)
+        const isXLSX = (buf) => {
+          const bytes = new Uint8Array(buf.slice(0,4));
+          return bytes[0]===0x50 && bytes[1]===0x4B && bytes[2]===0x03 && bytes[3]===0x04;
         };
 
         const parseAmt = (v) => {
-          if (!v) return 0;
-          // Remove currency symbols and spaces, handle Brazilian format (1.234,56 or 1234.56)
+          if (v === null || v === undefined || v === '') return 0;
           let s = v.toString().replace(/[R$\s]/g,'').trim();
-          // If both . and , present: . is thousands separator, , is decimal
           if (s.includes('.') && s.includes(',')) s = s.replace(/\./g,'').replace(',','.');
           else if (s.includes(',')) s = s.replace(',','.');
           return Math.abs(parseFloat(s)) || 0;
@@ -1381,54 +1367,126 @@ Regras:
 
         const parseDate = (v) => {
           if (!v) return todayStr();
-          v = v.replace(/["']/g,'').trim();
-          // DD/MM/YYYY
-          if (/^\d{2}\/\d{2}\/\d{4}$/.test(v)) {
-            const [d,m,y] = v.split('/'); return y+'-'+m+'-'+d;
-          }
-          // YYYY-MM-DD already
+          v = v.toString().replace(/["']/g,'').trim();
+          if (/^\d{2}\/\d{2}\/\d{4}$/.test(v)) { const [d,m,y]=v.split('/'); return y+'-'+m+'-'+d; }
           if (/^\d{4}-\d{2}-\d{2}$/.test(v)) return v;
-          // DD-MM-YYYY
-          if (/^\d{2}-\d{2}-\d{4}$/.test(v)) {
-            const [d,m,y] = v.split('-'); return y+'-'+m+'-'+d;
+          if (/^\d{2}-\d{2}-\d{4}$/.test(v)) { const [d,m,y]=v.split('-'); return y+'-'+m+'-'+d; }
+          // Excel serial date number
+          if (/^\d{5}$/.test(v)) {
+            const d = new Date(Date.UTC(1899,11,30) + parseInt(v)*86400000);
+            return d.toISOString().slice(0,10);
           }
           return todayStr();
         };
 
-        const getCell = (row, idx) => idx >= 0 && idx < row.length ? row[idx].replace(/^["']|["']$/g,'').trim() : '';
+        const buildEnriched = (rows) => {
+          // rows = [{date, title/description/desc, amount}, ...]
+          const enriched = [];
+          for (const row of rows) {
+            // Normalize field names
+            const desc = (row.title || row.description || row.descricao || row.estabelecimento || row.historico || row.lancamento || row.merchant || row.name || '').toString().trim();
+            const rawAmt = (row.amount !== undefined ? row.amount : row.valor !== undefined ? row.valor : row.value !== undefined ? row.value : row.total !== undefined ? row.total : '').toString();
+            const amount = parseAmt(rawAmt);
+            if (!desc || !amount) continue;
+            // Skip payment/credit lines
+            if (/pagamento recebido|estorno|credit|credito/i.test(desc) && parseFloat(rawAmt.replace(',','.')) < 0) continue;
 
-        const enriched = [];
-        for (let i = 1; i < lines.length; i++) {
-          const row = lines[i].split(sep);
-          const desc = colMap.desc >= 0 ? getCell(row, colMap.desc) : '';
-          const rawAmt = colMap.amount >= 0 ? getCell(row, colMap.amount) : '';
-          const amount = parseAmt(rawAmt);
-          if (!desc || !amount) continue;
+            const rawDate = (row.date || row.data || '').toString();
+            const date = parseDate(rawDate);
 
-          const date = parseDate(colMap.date >= 0 ? getCell(row, colMap.date) : '');
-          const installment = colMap.inst >= 0 ? getCell(row, colMap.inst) || null : null;
-          const csvCat = colMap.cat >= 0 ? getCell(row, colMap.cat) : '';
+            // Detect installment from description e.g. "Casa das Aliancas - Parcela 1/5"
+            const instMatch = desc.match(/(\d+\/\d+)/);
+            const installment = instMatch ? instMatch[1] : null;
+            const cleanDesc = desc.replace(/\s*[-–]?\s*[Pp]arcela\s*\d+\/\d+/,'').trim();
 
-          // Check memory for classification suggestion
-          const key = desc.toLowerCase().trim().slice(0,50);
-          const mem = classificationMemory[key];
-          const confidence = mem ? 'high' : 'low';
-          const module = mem ? (mem.module || 'personal') : 'personal';
-          const personId = mem ? (mem.personId || null) : null;
-          const category = mem ? mem.category : (csvCat || 'Outro');
+            const csvCat = (row.categoria || row.category || '').toString();
+            const key = cleanDesc.toLowerCase().trim().slice(0,50);
+            const mem = classificationMemory[key];
+            const confidence = mem ? 'high' : 'low';
+            const module = mem ? (mem.module || 'personal') : 'personal';
+            const personId = mem ? (mem.personId || null) : null;
+            const category = mem ? mem.category : (csvCat || 'Outro');
 
-          enriched.push({
-            id: uid(), description: desc, amount, date,
-            installment: installment || null,
-            category, module, personId,
-            type: 'expense', paymentMethod: 'Cartao de Credito',
-            status: 'paid', month: date.slice(0,7),
-            cardLabel: cardName || '', approved: false,
-            confidence, reason: mem ? 'Encontrado no historico' : (csvCat ? 'Categoria do CSV' : 'Novo lancamento'),
-          });
+            enriched.push({
+              id: uid(), description: cleanDesc, amount, date, installment,
+              category, module, personId,
+              type: 'expense', paymentMethod: 'Cartao de Credito',
+              status: 'paid', month: date.slice(0,7),
+              cardLabel: cardName || '', approved: false,
+              confidence, reason: mem ? 'Encontrado no historico' : (csvCat ? 'Categoria do CSV' : 'Novo lancamento'),
+            });
+          }
+          return enriched;
+        };
+
+        const buf = await files[0].arrayBuffer();
+        let enriched = [];
+
+        if (isXLSX(buf)) {
+          // ---- XLSX/Excel file (Nubank exports this format) ----
+          setProgress('Lendo planilha Excel...');
+          // Dynamically import SheetJS from CDN
+          const XLSX = await import('https://cdn.sheetjs.com/xlsx-0.20.3/package/xlsx.mjs');
+          const wb = XLSX.read(buf, { type: 'array' });
+          const ws = wb.Sheets[wb.SheetNames[0]];
+          const raw = XLSX.utils.sheet_to_csv(ws, { FS: ',' });
+          // Now parse as CSV
+          const lines = raw.split(/\r?\n/).filter(l => l.trim());
+
+          // --- Nubank special case: single column where the first cell IS the header row ---
+          // Row 0 value looks like: "date,title,amount"  (entire CSV embedded in one cell)
+          if (lines.length > 1) {
+            const firstCell = lines[0].trim();
+            // Check if the first cell itself contains comma-separated column names
+            const innerSep = firstCell.includes(';') ? ';' : ',';
+            const innerHeaders = firstCell.split(innerSep).map(h => h.replace(/^["']|["']$/g,'').trim().toLowerCase());
+            const looksEmbedded = innerHeaders.length >= 2 && /date|data|title|descri/.test(innerHeaders.join('|'));
+
+            let rows = [];
+            if (looksEmbedded) {
+              // Each subsequent line[i] is also a single cell that contains the full row
+              const sep = innerSep;
+              for (let i = 1; i < lines.length; i++) {
+                const cells = lines[i].split(sep);
+                if (cells.length < innerHeaders.length) continue;
+                const obj = {};
+                innerHeaders.forEach((h, idx) => { obj[h] = cells[idx]?.replace(/^["']|["']$/g,'').trim() || ''; });
+                rows.push(obj);
+              }
+            } else {
+              // Normal multi-column XLSX
+              const sep = lines[0].includes(';') ? ';' : ',';
+              const headers = lines[0].split(sep).map(h => h.replace(/^["']|["']$/g,'').trim().toLowerCase());
+              for (let i = 1; i < lines.length; i++) {
+                const cells = lines[i].split(sep);
+                if (cells.length < 2) continue;
+                const obj = {};
+                headers.forEach((h, idx) => { obj[h] = cells[idx]?.replace(/^["']|["']$/g,'').trim() || ''; });
+                rows.push(obj);
+              }
+            }
+            enriched = buildEnriched(rows);
+          }
+        } else {
+          // ---- Plain CSV ----
+          setProgress('Lendo CSV...');
+          const text = new TextDecoder('utf-8').decode(buf);
+          const lines = text.split(/\r?\n/).filter(l => l.trim());
+          if (!lines.length) throw new Error('Arquivo CSV vazio.');
+          const sep = lines[0].includes(';') ? ';' : ',';
+          const headers = lines[0].split(sep).map(h => h.replace(/^["']|["']$/g,'').trim().toLowerCase());
+          const rows = [];
+          for (let i = 1; i < lines.length; i++) {
+            const cells = lines[i].split(sep);
+            if (cells.length < 2) continue;
+            const obj = {};
+            headers.forEach((h, idx) => { obj[h] = cells[idx]?.replace(/^["']|["']$/g,'').trim() || ''; });
+            rows.push(obj);
+          }
+          enriched = buildEnriched(rows);
         }
 
-        if (!enriched.length) throw new Error('Nenhum lancamento encontrado no CSV. Verifique o formato do arquivo.');
+        if (!enriched.length) throw new Error('Nenhum lancamento encontrado. Verifique se o arquivo e uma fatura valida exportada do banco.');
         setItems(enriched); setStep('review');
         setProcessing(false); setProgress('');
         return;
