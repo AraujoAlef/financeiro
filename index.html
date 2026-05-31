@@ -1292,7 +1292,14 @@ function FaturaImport({ people, onImportTransactions, classificationMemory, onSa
       setFiles([f]); setPreviews([]); setError('');
     } else if (inputMode === 'csv') {
       const f = arr[0];
-      if (!f || (!f.name.endsWith('.csv') && f.type !== 'text/csv')) { setError('Envie um arquivo .CSV.'); return; }
+      const csvOk = f && (
+        f.name.endsWith('.csv') || f.name.endsWith('.xlsx') || f.name.endsWith('.xls') ||
+        f.type === 'text/csv' || f.type === 'text/plain' ||
+        f.type === 'application/vnd.ms-excel' ||
+        f.type === 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' ||
+        f.type === '' // some browsers report no type for csv
+      );
+      if (!f || !csvOk) { setError('Envie um arquivo .CSV ou .XLSX exportado do banco.'); return; }
       setFiles([f]); setPreviews([]); setError('');
     } else {
       const imgs = arr.filter(f => IMAGE_TYPES.includes(f.type));
@@ -1322,8 +1329,8 @@ function FaturaImport({ people, onImportTransactions, classificationMemory, onSa
   };
 
   const processInvoice = async () => {
-    if (!files.length) return setError(inputMode === 'pdf' ? 'Selecione um PDF.' : inputMode === 'csv' ? 'Selecione um arquivo CSV.' : 'Adicione ao menos um print.');
-    if (!apiKey) return setError('Informe sua chave de API Anthropic.');
+    if (!files.length) return setError(inputMode === 'pdf' ? 'Selecione um PDF.' : inputMode === 'csv' ? 'Selecione um arquivo CSV ou XLSX.' : 'Adicione ao menos um print.');
+    if (inputMode !== 'csv' && !apiKey) return setError('Informe sua chave de API Anthropic.');
     setProcessing(true); setError(''); setProgress('Preparando arquivo...');
     try {
       const ctx = buildClassificationContext(classificationMemory);
@@ -1692,7 +1699,7 @@ Regras:
 
   // ---- UPLOAD STEP ----
   const inputId = inputMode === 'pdf' ? 'file-input-pdf' : inputMode === 'csv' ? 'file-input-csv' : 'file-input-img';
-  const acceptStr = inputMode === 'pdf' ? 'application/pdf' : inputMode === 'csv' ? '.csv,text/csv' : 'image/jpeg,image/jpg,image/png,image/webp';
+  const acceptStr = inputMode === 'pdf' ? 'application/pdf' : inputMode === 'csv' ? '.csv,.xlsx,.xls,text/csv,application/vnd.ms-excel,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' : 'image/jpeg,image/jpg,image/png,image/webp';
   const hasFiles = files.length > 0;
 
   return (
@@ -1811,8 +1818,8 @@ Regras:
                     <button onClick={e=>{e.stopPropagation();setFiles([]);}} style={{marginLeft:10,background:'none',border:'none',color:'var(--danger)',cursor:'pointer',fontSize:12}}>✕ Trocar</button>
                   </div></>
               : <><div style={{fontSize:42,marginBottom:10}}>📊</div>
-                  <div style={{fontFamily:'Syne',fontSize:16,fontWeight:700}}>Arraste o CSV aqui</div>
-                  <div style={{fontSize:13,color:'var(--muted)',marginTop:6}}>ou clique para selecionar · arquivo .csv exportado do banco</div></>
+                  <div style={{fontFamily:'Syne',fontSize:16,fontWeight:700}}>Arraste o arquivo aqui</div>
+                  <div style={{fontSize:13,color:'var(--muted)',marginTop:6}}>ou clique para selecionar · .CSV ou .XLSX exportado do banco</div></>
           )}
 
           {/* PDF mode */}
@@ -1887,9 +1894,9 @@ Regras:
           <div style={{background:'#f0fdf4',border:'1px solid #bbf7d0',borderRadius:10,
             padding:'12px 16px',marginBottom:20,fontSize:13,color:'#14532d',lineHeight:1.6}}>
             <strong>⚡ Processamento instantaneo — sem IA necessaria!</strong><br/>
-            Exporte o CSV direto do site do banco (Nubank, Santander, Itau, etc).
-            O sistema le automaticamente a data, descricao e valor. As classificacoes
-            do historico sao aplicadas na hora.
+            Exporte o arquivo direto do site ou app do banco. Funciona com <strong>.CSV e .XLSX</strong>.<br/>
+            <strong>Nubank:</strong> Fatura → Exportar → o arquivo baixado ja funciona diretamente aqui.<br/>
+            O sistema le automaticamente data, descricao e valor, e aplica o historico de classificacoes.
           </div>
         )}
 
