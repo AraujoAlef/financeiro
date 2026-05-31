@@ -1957,6 +1957,350 @@ Regras:
   );
 }
 
+// ==================== COLAR FATURA MODULE ====================
+
+function ColarFatura({ people, onImportTransactions, classificationMemory, onSaveMemory }) {
+  const [step, setStep] = useState('paste');
+  const [text, setText] = useState('');
+  const [cardName, setCardName] = useState('');
+  const [items, setItems] = useState([]);
+  const [error, setError] = useState('');
+  const [approved, setApproved] = useState([]);
+
+  const parseAmt = (v) => {
+    if (!v && v !== 0) return 0;
+    let s = v.toString().replace(/[R$\s]/g,'').trim();
+    if (s.includes('.') && s.includes(',')) s = s.replace(/\./g,'').replace(',','.');
+    else if (s.includes(',')) s = s.replace(',','.');
+    return Math.abs(parseFloat(s)) || 0;
+  };
+
+  const parseDate = (v) => {
+    if (!v) return todayStr();
+    v = v.toString().trim();
+    if (/^\d{2}\/\d{2}\/\d{4}$/.test(v)) { const [d,m,y]=v.split('/'); return y+'-'+m+'-'+d; }
+    if (/^\d{4}-\d{2}-\d{2}$/.test(v)) return v;
+    if (/^\d{2}-\d{2}-\d{4}$/.test(v)) { const [d,m,y]=v.split('-'); return y+'-'+m+'-'+d; }
+    if (/^\d{2}\/\d{2}\/\d{2}$/.test(v)) { const [d,m,y]=v.split('/'); return '20'+y+'-'+m+'-'+d; }
+    return todayStr();
+  };
+
+  const processText = () => {
+    if (!text.trim()) return setError('Cole o texto da fatura primeiro.');
+    setError('');
+
+    const lines = text.trim().split(/\r?\n/).filter(l => l.trim());
+    const enriched = [];
+
+    for (const line of lines) {
+      // Try multiple separators: tab (Excel copy), comma, semicolon
+      let cells = [];
+      if (line.includes('\t')) {
+        cells = line.split('\t').map(c => c.trim());
+      } else {
+        // Count commas to detect CSV inline (Nubank: "2026-05-23,Ziyou,279.00")
+        const commas = (line.match(/,/g)||[]).length;
+        const semis  = (line.match(/;/g)||[]).length;
+        const sep = semis > commas ? ';' : ',';
+        cells = line.split(sep).map(c => c.replace(/^["']|["']$/g,'').trim());
+      }
+
+      if (cells.length < 2) continue;
+
+      // Detect header line
+      const joined = cells.join('|').toLowerCase();
+      if (/date|data|title|descri|amount|valor/.test(joined) && !/\d{4}/.test(cells[0])) continue;
+
+      // Try to identify columns by position and content
+      let date = '', desc = '', amtRaw = '';
+
+      // Heuristic: find which cell looks like a date
+      const dateIdx = cells.findIndex(c => /^\d{4}-\d{2}-\d{2}$/.test(c) || /^\d{2}\/\d{2}\/\d{4}$/.test(c) || /^\d{2}\/\d{2}\/\d{2}$/.test(c));
+      // Find which cell looks like an amount (number, possibly with . , R$)
+      const amtIdx = cells.findIndex((c,i) => i !== dateIdx && /^-?[\d.,R$\s]+$/.test(c) && /\d/.test(c));
+
+      if (dateIdx >= 0 && amtIdx >= 0) {
+        date = parseDate(cells[dateIdx]);
+        amtRaw = cells[amtIdx];
+        // desc is whatever is left
+        desc = cells.filter((_,i) => i !== dateIdx && i !== amtIdx).join(' ').trim();
+      } else if (cells.length === 3) {
+        // Nubank format: date, title, amount
+        date = parseDate(cells[0]);
+        desc = cells[1];
+        amtRaw = cells[2];
+      } else if (cells.length === 2) {
+        // desc + amount
+        desc = cells[0];
+        amtRaw = cells[1];
+        date = todayStr();
+      } else {
+        // Try last cell as amount, first as date if date-like, rest as desc
+        amtRaw = cells[cells.length - 1];
+        if (/^\d{4}-\d{2}/.test(cells[0]) || /^\d{2}\//.test(cells[0])) {
+          date = parseDate(cells[0]);
+          desc = cells.slice(1, -1).join(' ');
+        } else {
+          desc = cells.slice(0, -1).join(' ');
+          date = todayStr();
+        }
+      }
+
+      const amount = parseAmt(amtRaw);
+      if (!desc || !amount) continue;
+
+      // Skip payment/credit lines (negative amounts from bank)
+      if (/pagamento recebido|estorno/i.test(desc)) continue;
+      // Skip if original value was negative (credit)
+      const raw = amtRaw.toString().replace(/[R$\s]/g,'').replace(',','.');
+      if (parseFloat(raw) < 0) continue;
+
+      // Detect installment
+      const instMatch = desc.match(/(\d+\/\d+)/);
+      const installment = instMatch ? instMatch[1] : null;
+      const cleanDesc = desc.replace(/\s*[-–]?\s*[Pp]arcela\s*\d+\/\d+/,'').trim();
+
+      const key = cleanDesc.toLowerCase().trim().slice(0,50);
+      const mem = classificationMemory[key];
+      const confidence = mem ? 'high' : 'low';
+      const mod = mem ? (mem.module || 'personal') : 'personal';
+      const personId = mem ? (mem.personId || null) : null;
+      const category = mem ? mem.category : 'Outro';
+
+      enriched.push({
+        id: uid(), description: cleanDesc, amount, date, installment,
+        category, module: mod, personId,
+        type: 'expense', paymentMethod: 'Cartao de Credito',
+        status: 'paid', month: date.slice(0,7),
+        cardName: cardName || '', approved: true,
+        confidence, reason: mem ? 'Encontrado no historico' : 'Novo lancamento',
+      });
+    }
+
+    if (!enriched.length) return setError('Nenhum lançamento encontrado. Verifique se o texto está no formato correto (data, descrição, valor).');
+    setItems(enriched);
+    setApproved(enriched.map(i => i.id));
+    setStep('review');
+  };
+
+  const updateItem = (id, changes) => setItems(prev => prev.map(it => it.id===id ? {...it,...changes} : it));
+  const toggleApprove = (id) => setApproved(prev => prev.includes(id) ? prev.filter(x=>x!==id) : [...prev, id]);
+  const approveAll = () => setApproved(items.map(i=>i.id));
+  const unapproveAll = () => setApproved([]);
+
+  const handleImport = () => {
+    const toImport = items.filter(it => approved.includes(it.id));
+    if (!toImport.length) return setError('Aprove ao menos um lançamento.');
+    const newMemory = {...classificationMemory};
+    toImport.forEach(it => {
+      const key = it.description.toLowerCase().trim().slice(0,50);
+      const person = people.find(p => p.id===it.personId);
+      newMemory[key] = { module:it.module, personId:it.personId||null, personName:person?.name||null, category:it.category, updatedAt:new Date().toISOString() };
+    });
+    onSaveMemory(newMemory);
+    const final = toImport.map(({approved,confidence,reason,...tx})=>tx);
+    onImportTransactions(final);
+  };
+
+  const reset = () => { setStep('paste'); setText(''); setItems([]); setApproved([]); setError(''); };
+
+  const cfColor = { high:'#16a34a', medium:'#d97706', low:'#94a3b8' };
+  const cfLabel = { high:'Aprendido', medium:'Inferido', low:'Novo' };
+  const cfEmoji = { high:'✅', medium:'🔍', low:'❓' };
+  const getPerson = (id) => people.find(p=>p.id===id);
+  const approvedItems = items.filter(i => approved.includes(i.id));
+  const totalApproved = approvedItems.reduce((s,i)=>s+i.amount,0);
+
+  if (step === 'review') return (
+    <div className="page">
+      <div style={{display:'flex',gap:12,marginBottom:20,flexWrap:'wrap',alignItems:'center'}}>
+        <div style={{flex:1,minWidth:200}}>
+          <div style={{fontFamily:'Syne',fontSize:18,fontWeight:700}}>📋 Revisar {items.length} lançamentos</div>
+          <div style={{color:'var(--muted)',fontSize:13,marginTop:4}}>
+            {approvedItems.length} aprovados · Total: {fmt(totalApproved)}
+          </div>
+        </div>
+        <button className="btn btn-ghost btn-sm" onClick={unapproveAll}>Desmarcar todos</button>
+        <button className="btn btn-ghost btn-sm" onClick={approveAll}>✅ Aprovar todos</button>
+        <button className="btn btn-primary" onClick={handleImport}>⬇️ Importar ({approvedItems.length})</button>
+        <button className="btn btn-ghost btn-sm" onClick={reset}>← Voltar</button>
+      </div>
+
+      {error && <div style={{background:'#fef2f2',border:'1px solid #fca5a5',borderRadius:8,padding:'10px 16px',marginBottom:16,color:'#dc2626',fontSize:13}}>{error}</div>}
+
+      <div style={{display:'flex',gap:16,marginBottom:14,flexWrap:'wrap',alignItems:'center'}}>
+        {['high','low'].map(k=>(
+          <span key={k} style={{fontSize:12,color:cfColor[k],fontWeight:600,background:cfColor[k]+'15',padding:'3px 10px',borderRadius:20}}>
+            {cfEmoji[k]} {cfLabel[k]}
+          </span>
+        ))}
+        <span style={{fontSize:12,color:'var(--muted)'}}>Edite qualquer campo antes de importar</span>
+      </div>
+
+      <div className="section-card">
+        <table>
+          <thead><tr>
+            <th style={{width:40,textAlign:'center'}}>
+              <input type="checkbox" onChange={e=>e.target.checked?approveAll():unapproveAll()} checked={approved.length===items.length && items.length>0} />
+            </th>
+            <th>Descrição</th>
+            <th>Data</th>
+            <th>Módulo / Parente</th>
+            <th>Categoria</th>
+            <th style={{textAlign:'right'}}>Valor</th>
+            <th>IA</th>
+          </tr></thead>
+          <tbody>
+            {items.map(item => {
+              const person = getPerson(item.personId);
+              const isApproved = approved.includes(item.id);
+              return (
+                <tr key={item.id} style={{opacity:isApproved?1:0.4}}>
+                  <td style={{textAlign:'center'}}>
+                    <input type="checkbox" checked={isApproved} onChange={()=>toggleApprove(item.id)} />
+                  </td>
+                  <td>
+                    <div style={{fontWeight:600,fontSize:13}}>{item.description}</div>
+                    {item.installment && <div style={{fontSize:11,color:'var(--accent)',marginTop:2,fontFamily:'DM Mono'}}>Parcela {item.installment}</div>}
+                  </td>
+                  <td>
+                    <input type="date" className="form-control" style={{padding:'5px 8px',fontSize:12,width:136}}
+                      value={item.date||''} onChange={e=>updateItem(item.id,{date:e.target.value,month:e.target.value.slice(0,7)})} />
+                  </td>
+                  <td style={{minWidth:190}}>
+                    <select className="form-control" style={{padding:'5px 8px',fontSize:12,marginBottom:5}}
+                      value={item.module} onChange={e=>updateItem(item.id,{module:e.target.value,personId:e.target.value!=='family'?null:item.personId})}>
+                      <option value="personal">👤 Pessoal</option>
+                      <option value="family">👨‍👩‍👧 Família</option>
+                      <option value="agency">✈️ Agência</option>
+                    </select>
+                    {item.module==='family' && (
+                      <select className="form-control" style={{padding:'5px 8px',fontSize:12}}
+                        value={item.personId||''} onChange={e=>updateItem(item.id,{personId:e.target.value})}>
+                        <option value="">Selecionar parente...</option>
+                        {people.map(p=><option key={p.id} value={p.id}>{p.emoji} {p.name}</option>)}
+                      </select>
+                    )}
+                    {item.module==='family' && person && (
+                      <div style={{fontSize:12,color:person.color,fontWeight:700,marginTop:4}}>{person.emoji} {person.name}</div>
+                    )}
+                  </td>
+                  <td>
+                    <select className="form-control" style={{padding:'5px 8px',fontSize:12}}
+                      value={item.category||'Outro'} onChange={e=>updateItem(item.id,{category:e.target.value})}>
+                      {CAT_EXPENSE.map(cat=><option key={cat} value={cat}>{CATEGORY_ICONS[cat]||'📝'} {cat}</option>)}
+                    </select>
+                  </td>
+                  <td style={{textAlign:'right'}}>
+                    <span className="amount-neg" style={{fontFamily:'DM Mono',fontSize:13,fontWeight:600}}>{fmt(item.amount)}</span>
+                  </td>
+                  <td>
+                    <span style={{fontSize:11,fontWeight:700,color:cfColor[item.confidence||'low'],
+                      background:cfColor[item.confidence||'low']+'18',padding:'3px 8px',borderRadius:12,whiteSpace:'nowrap'}}>
+                      {cfEmoji[item.confidence||'low']} {cfLabel[item.confidence||'low']}
+                    </span>
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+
+  // PASTE STEP
+  return (
+    <div className="page">
+      <div style={{maxWidth:680,margin:'0 auto'}}>
+
+        {/* Instrucoes */}
+        <div style={{background:'#eff6ff',border:'1px solid #bfdbfe',borderRadius:12,padding:'16px 20px',marginBottom:20}}>
+          <div style={{fontFamily:'Syne',fontWeight:700,fontSize:14,color:'#1e40af',marginBottom:8}}>
+            📋 Como usar este módulo
+          </div>
+          <div style={{fontSize:13,color:'#1e3a8a',lineHeight:1.8}}>
+            <strong>Nubank (e outros bancos):</strong><br/>
+            1. Abra o arquivo da fatura no Excel ou Google Sheets<br/>
+            2. Selecione tudo <kbd style={{background:'#dbeafe',padding:'1px 6px',borderRadius:4,fontFamily:'DM Mono',fontSize:11}}>Ctrl+A</kbd> e copie <kbd style={{background:'#dbeafe',padding:'1px 6px',borderRadius:4,fontFamily:'DM Mono',fontSize:11}}>Ctrl+C</kbd><br/>
+            3. Cole aqui abaixo <kbd style={{background:'#dbeafe',padding:'1px 6px',borderRadius:4,fontFamily:'DM Mono',fontSize:11}}>Ctrl+V</kbd> e clique em Processar<br/>
+            <span style={{color:'#3b82f6',marginTop:4,display:'block'}}>✅ Funciona com qualquer formato: CSV, Excel, cópia direta do app do banco</span>
+          </div>
+        </div>
+
+        {/* Card name */}
+        <div className="section-card" style={{marginBottom:20}}>
+          <div className="section-header"><span className="section-title">💳 Cartão de Crédito</span></div>
+          <div style={{padding:'16px 24px'}}>
+            <input className="form-control" placeholder="Ex: Nubank, Santander, Itaú, XP, C6..."
+              value={cardName} onChange={e=>setCardName(e.target.value)} />
+          </div>
+        </div>
+
+        {/* Text area */}
+        <div className="section-card" style={{marginBottom:20}}>
+          <div className="section-header">
+            <span className="section-title">📄 Cole o texto da fatura aqui</span>
+            {text && <span style={{fontSize:12,color:'var(--success)',fontWeight:600}}>
+              {text.trim().split('\n').filter(l=>l.trim()).length} linhas
+            </span>}
+          </div>
+          <div style={{padding:'16px 24px'}}>
+            <textarea
+              className="form-control"
+              placeholder={"Cole aqui o conteúdo copiado da planilha ou do app do banco...\n\nExemplo:\n2026-05-23\tZiyou\t279.00\n2026-05-17\tFarmelhor Nacoes\t54.50\n2026-05-10\tCasa das Aliancas - Parcela 1/5\t280.00"}
+              value={text}
+              onChange={e=>setText(e.target.value)}
+              style={{minHeight:220,fontFamily:'DM Mono',fontSize:12,lineHeight:1.7,resize:'vertical'}}
+            />
+            {text && (
+              <button onClick={()=>setText('')}
+                style={{marginTop:8,background:'none',border:'none',color:'var(--muted)',cursor:'pointer',fontSize:12}}>
+                ✕ Limpar
+              </button>
+            )}
+          </div>
+        </div>
+
+        {/* Memory */}
+        {Object.keys(classificationMemory).length > 0 && (
+          <div className="section-card" style={{marginBottom:20}}>
+            <div className="section-header">
+              <span className="section-title">🧠 Memória de Classificações</span>
+              <span style={{fontSize:12,color:'var(--success)',fontWeight:600,background:'#dcfce7',padding:'3px 10px',borderRadius:20}}>
+                {Object.keys(classificationMemory).length} aprendidos
+              </span>
+            </div>
+            <div style={{padding:'8px 16px',maxHeight:130,overflowY:'auto'}}>
+              {Object.entries(classificationMemory).slice(-20).reverse().map(([key,val])=>(
+                <div key={key} style={{display:'flex',justifyContent:'space-between',padding:'5px 0',borderBottom:'1px solid #f1f5f9',fontSize:12}}>
+                  <span style={{fontFamily:'DM Mono',overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap',maxWidth:'52%'}}>{key}</span>
+                  <span style={{color:val.personName?'var(--family)':'var(--muted)',fontWeight:600,flexShrink:0}}>
+                    {val.personName?'👤 '+val.personName:val.module==='agency'?'✈️ Agência':'🙋 Pessoal'}
+                    <span style={{color:'var(--muted)',fontWeight:400,marginLeft:4}}>· {val.category}</span>
+                  </span>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {error && <div style={{background:'#fef2f2',border:'1px solid #fca5a5',borderRadius:8,padding:'10px 16px',marginBottom:16,color:'#dc2626',fontSize:13}}>{error}</div>}
+
+        <button className="btn btn-primary"
+          style={{width:'100%',justifyContent:'center',padding:'15px',fontSize:15,borderRadius:10}}
+          onClick={processText} disabled={!text.trim()}>
+          ⚡ Processar lançamentos
+        </button>
+
+        <div style={{marginTop:14,fontSize:12,color:'var(--muted)',textAlign:'center'}}>
+          Processamento local · instantâneo · sem IA · sem internet necessária
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // ==================== COBRAR MODULE ====================
 
 function CobrarModule({ transactions, people, month }) {
@@ -2307,6 +2651,7 @@ function App() {
     { id:'reports',   icon:'📈', label:'Relatórios' },
     { id:'fatura',    icon:'📤', label:'Importar Fatura' },
     { id:'cobrar',    icon:'💬', label:'Cobrar Parentes' },
+    { id:'colar',     icon:'📋', label:'Colar Fatura' },
   ];
 
   const pageTitle = {
@@ -2317,6 +2662,7 @@ function App() {
     reports: '📈 Relatórios',
     fatura: '📤 Importar Fatura PDF',
     cobrar: '💬 Cobrar Parentes',
+    colar: '📋 Colar Fatura',
   };
 
   const addLabel = {
@@ -2327,6 +2673,7 @@ function App() {
     reports: null,
     fatura: null,
     cobrar: null,
+    colar: null,
   };
 
   const addMod = { family:'family', personal:'personal', agency:'agency', dashboard:'personal' };
@@ -2378,6 +2725,7 @@ function App() {
         {view==='reports'   && <Reports transactions={transactions} people={people} month={month} />}
         {view==='fatura'    && <FaturaImport people={people} onImportTransactions={handleImportTransactions} classificationMemory={classificationMemory} onSaveMemory={handleSaveMemory} />}
         {view==='cobrar'    && <CobrarModule transactions={transactions} people={people} month={month} />}
+        {view==='colar'     && <ColarFatura people={people} onImportTransactions={handleImportTransactions} classificationMemory={classificationMemory} onSaveMemory={handleSaveMemory} />}
       </main>
 
       {/* MODAL */}
