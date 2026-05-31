@@ -561,6 +561,17 @@ const nowMonth = () => { const d = new Date(); return `${d.getFullYear()}-${Stri
 const todayStr = () => new Date().toISOString().split('T')[0];
 const uid = () => Math.random().toString(36).slice(2,10);
 
+// Duplicate detection: returns similar existing transactions
+const findDuplicates = (tx, existing) => {
+  const descNorm = (s) => (s||'').toLowerCase().replace(/\s+/g,' ').trim().slice(0,40);
+  const sameMonth = existing.filter(e =>
+    e.month === tx.month &&
+    Math.abs(e.amount - tx.amount) < 0.01 &&
+    descNorm(e.description) === descNorm(tx.description)
+  );
+  return sameMonth;
+};
+
 const COLORS = ['#fb923c','#60a5fa','#a78bfa','#34d399','#f472b6','#fbbf24','#38bdf8','#4ade80'];
 const CATEGORY_ICONS = {
   'Alimentação':'🍽️','Transporte':'🚗','Saúde':'🏥','Lazer':'🎮','Roupas':'👕',
@@ -862,9 +873,11 @@ function AddTransactionModal({ onClose, onSave, people, defaultModule }) {
 }
 
 // ==================== TRANSACTIONS TABLE ====================
-function TransactionsTable({ transactions, people, onDelete, title, showPerson=false }) {
+function TransactionsTable({ transactions, people, onDelete, onUpdate, title, showPerson=false }) {
   const [search, setSearch] = useState('');
   const [filterType, setFilterType] = useState('all');
+  const [editingId, setEditingId] = useState(null);
+  const [editDesc, setEditDesc] = useState('');
 
   const filtered = transactions.filter(t=>{
     const q = search.toLowerCase();
@@ -874,6 +887,13 @@ function TransactionsTable({ transactions, people, onDelete, title, showPerson=f
   });
 
   const getPerson = (id) => people.find(p=>p.id===id);
+
+  const startEdit = (t) => { setEditingId(t.id); setEditDesc(t.description); };
+  const cancelEdit = () => { setEditingId(null); setEditDesc(''); };
+  const saveEdit = (t) => {
+    if (onUpdate && editDesc.trim()) onUpdate(t.id, { description: editDesc.trim() });
+    cancelEdit();
+  };
 
   return (
     <div className="section-card">
@@ -909,11 +929,32 @@ function TransactionsTable({ transactions, people, onDelete, title, showPerson=f
             <tbody>
               {filtered.map(t=>{
                 const p = getPerson(t.personId);
+                const isEditing = editingId === t.id;
                 return (
                   <tr key={t.id}>
                     <td>
-                      <div style={{fontWeight:500}}>{CATEGORY_ICONS[t.category]||'📝'} {t.description}</div>
-                      {t.notes && <div style={{fontSize:'11px',color:'var(--muted)',marginTop:'2px'}}>{t.notes}</div>}
+                      {isEditing ? (
+                        <div style={{display:'flex',gap:6,alignItems:'center'}}>
+                          <input
+                            className="form-control"
+                            style={{padding:'5px 8px',fontSize:13,flex:1}}
+                            value={editDesc}
+                            onChange={e=>setEditDesc(e.target.value)}
+                            onKeyDown={e=>{ if(e.key==='Enter') saveEdit(t); if(e.key==='Escape') cancelEdit(); }}
+                            autoFocus
+                          />
+                          <button className="btn btn-primary btn-sm" onClick={()=>saveEdit(t)}>✓</button>
+                          <button className="btn btn-ghost btn-sm" onClick={cancelEdit}>✕</button>
+                        </div>
+                      ) : (
+                        <div style={{display:'flex',alignItems:'center',gap:6}}>
+                          <div>
+                            <div style={{fontWeight:500}}>{CATEGORY_ICONS[t.category]||'📝'} {t.description}</div>
+                            {t.notes && <div style={{fontSize:'11px',color:'var(--muted)',marginTop:'2px'}}>{t.notes}</div>}
+                          </div>
+                          {onUpdate && <button className="action-btn" onClick={()=>startEdit(t)} title="Editar descrição" style={{opacity:0.4,fontSize:12}}>✏️</button>}
+                        </div>
+                      )}
                     </td>
                     {showPerson && <td>{p ? <span className="person-chip" style={{background:p.color+'22',color:p.color,border:'none',padding:'3px 10px'}}>{p.emoji} {p.name}</span> : '-'}</td>}
                     <td><span className="badge" style={{background:'rgba(255,255,255,0.06)',color:'var(--text)'}}>{CATEGORY_ICONS[t.category]||'📝'} {t.category}</span></td>
@@ -935,7 +976,146 @@ function TransactionsTable({ transactions, people, onDelete, title, showPerson=f
 }
 
 // ==================== FAMILY MODULE ====================
-function FamilyModule({ transactions, people, onDelete, month, onManagePeople }) {
+// ==================== PARCELAS FUTURAS ====================
+function ParcelasFuturas({ transactions }) {
+  // Find all installment transactions across ALL months
+  const allInstallments = transactions.filter(t => {
+    const desc = t.description || '';
+    const inst = t.installment || desc.match(/(\d+)\/(\d+)/)?.[0];
+    return inst;
+  });
+
+  // Group by "base description" — strip the installment number to find the series
+  const seriesMap = {};
+  allInstallments.forEach(t => {
+    const desc = t.description || '';
+    const instStr = t.installment || (desc.match(/(\d+\/\d+)/)||[])[0];
+    if (!instStr) return;
+    const [cur, total] = instStr.split('/').map(Number);
+    if (!cur || !total || total <= 1) return;
+
+    // Base key: description without installment info
+    const base = desc.replace(/\s*\d+\/\d+\s*/g,'').replace(/\s*[-–]?\s*[Pp]arcela\s*/g,'').trim().toLowerCase();
+    if (!seriesMap[base]) seriesMap[base] = [];
+    seriesMap[base].push({ ...t, curInst: cur, totalInst: total, instStr });
+  });
+
+  // Build future installments for each series
+  const today = new Date();
+  const futures = [];
+
+  Object.entries(seriesMap).forEach(([base, txs]) => {
+    // Use the transaction with the highest installment number as reference
+    const ref = txs.reduce((a,b) => b.curInst > a.curInst ? b : a);
+    const { curInst, totalInst, amount, date, description, personId, module, category } = ref;
+
+    // Calculate future installments (those not yet imported)
+    const knownInsts = new Set(txs.map(t => t.curInst));
+
+    for (let i = 1; i <= totalInst; i++) {
+      if (knownInsts.has(i)) continue; // already in system
+      // Calculate approximate date based on ref date + month offset
+      const refDate = new Date(date + 'T12:00:00');
+      const monthOffset = i - curInst;
+      const futDate = new Date(refDate);
+      futDate.setMonth(futDate.getMonth() + monthOffset);
+      const futDateStr = futDate.toISOString().slice(0,7);
+      // Only show future months
+      const futMonth = futDate.getFullYear() * 100 + (futDate.getMonth() + 1);
+      const todayMonth = today.getFullYear() * 100 + (today.getMonth() + 1);
+      if (futMonth < todayMonth) continue;
+
+      futures.push({
+        key: base + '-' + i,
+        description: description.replace(/\s*\d+\/\d+\s*/g,'').replace(/\s*[-–]?\s*[Pp]arcela\s*/g,'').trim(),
+        installment: i + '/' + totalInst,
+        amount, month: futDateStr, personId, module, category,
+        daysAway: Math.round((futDate - today) / 86400000),
+      });
+    }
+  });
+
+  // Sort by month
+  futures.sort((a,b) => a.month.localeCompare(b.month));
+
+  // Group by month
+  const byMonth = {};
+  futures.forEach(f => {
+    if (!byMonth[f.month]) byMonth[f.month] = [];
+    byMonth[f.month].push(f);
+  });
+
+  const totalFuture = futures.reduce((s,f) => s + f.amount, 0);
+
+  if (!futures.length) return (
+    <div className="section-card">
+      <div className="empty-state">
+        <div className="empty-icon">🎉</div>
+        <div className="empty-title">Nenhuma parcela futura detectada</div>
+        <p style={{color:'var(--muted)',fontSize:13,marginTop:6}}>
+          Importe faturas com compras parceladas para ver a previsão aqui
+        </p>
+      </div>
+    </div>
+  );
+
+  return (
+    <div>
+      {/* Summary cards */}
+      <div className="stats-grid" style={{marginBottom:24}}>
+        <div className="stat-card orange">
+          <div className="stat-label">📅 Parcelas Pendentes</div>
+          <div className="stat-value" style={{color:'var(--family)'}}>{futures.length}</div>
+          <div className="stat-sub">em {Object.keys(byMonth).length} meses</div>
+        </div>
+        <div className="stat-card red">
+          <div className="stat-label">💸 Total Comprometido</div>
+          <div className="stat-value" style={{color:'var(--danger)'}}>{fmt(totalFuture)}</div>
+          <div className="stat-sub">soma de todas as parcelas</div>
+        </div>
+        {Object.entries(byMonth).slice(0,3).map(([m,txs]) => (
+          <div key={m} className="stat-card" style={{borderTop:'3px solid var(--warning)'}}>
+            <div className="stat-label">📅 {fmtMonth(m)}</div>
+            <div className="stat-value" style={{color:'var(--warning)'}}>{fmt(txs.reduce((s,t)=>s+t.amount,0))}</div>
+            <div className="stat-sub">{txs.length} parcela(s)</div>
+          </div>
+        ))}
+      </div>
+
+      {/* Month by month */}
+      {Object.entries(byMonth).map(([m, txs]) => (
+        <div key={m} className="section-card" style={{marginBottom:20}}>
+          <div className="section-header">
+            <span className="section-title">📅 {fmtMonth(m)}</span>
+            <span style={{fontFamily:'DM Mono',fontSize:13,fontWeight:600,color:'var(--warning)'}}>
+              {fmt(txs.reduce((s,t)=>s+t.amount,0))}
+            </span>
+          </div>
+          <table>
+            <thead><tr>
+              <th>Descrição</th><th>Parcela</th><th>Módulo</th><th>Categoria</th>
+              <th style={{textAlign:'right'}}>Valor</th>
+            </tr></thead>
+            <tbody>
+              {txs.map(f => (
+                <tr key={f.key}>
+                  <td><div style={{fontWeight:500}}>{CATEGORY_ICONS[f.category]||'📝'} {f.description}</div></td>
+                  <td><span style={{fontFamily:'DM Mono',fontSize:11,background:'#eff6ff',color:'var(--accent)',padding:'2px 8px',borderRadius:20,fontWeight:600}}>{f.installment}</span></td>
+                  <td><span className={`badge badge-${f.module}`}>{f.module==='personal'?'👤 Pessoal':f.module==='family'?'👨‍👩‍👧 Família':'✈️ Agência'}</span></td>
+                  <td style={{fontSize:12,color:'var(--muted)'}}>{f.category}</td>
+                  <td style={{textAlign:'right'}}><span className="amount-neg">{fmt(f.amount)}</span></td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+// ==================== FAMILY MODULE ====================
+function FamilyModule({ transactions, people, onDelete, onUpdate, month, onManagePeople }) {
   const [activeTab, setActiveTab] = useState('summary');
   const filtered = transactions.filter(t=>t.module==='family' && t.month===month);
 
@@ -945,6 +1125,18 @@ function FamilyModule({ transactions, people, onDelete, month, onManagePeople })
   });
 
   const totalFamily = filtered.reduce((s,t)=>s+t.amount,0);
+
+  // Count future installments for badge
+  const futureCount = useMemo(() => {
+    const today = new Date();
+    const todayMonth = today.getFullYear() * 100 + (today.getMonth() + 1);
+    return transactions.filter(t => {
+      const inst = t.installment || (t.description||'').match(/(\d+\/\d+)/)?.[0];
+      if (!inst) return false;
+      const [cur,total] = inst.split('/').map(Number);
+      return cur && total && cur < total;
+    }).length;
+  }, [transactions]);
 
   const handleCopyReport = (p) => {
     const lines = [`📋 *Relatório de Gastos — ${p.name}*\n`,`Mês: ${fmtMonth(month)}\n`,'─'.repeat(30)+'\n'];
@@ -977,6 +1169,9 @@ function FamilyModule({ transactions, people, onDelete, month, onManagePeople })
       <div className="tabs">
         <button className={`tab ${activeTab==='summary'?'active':''}`} onClick={()=>setActiveTab('summary')}>📊 Cobranças</button>
         <button className={`tab ${activeTab==='all'?'active':''}`} onClick={()=>setActiveTab('all')}>📋 Todos os Lançamentos</button>
+        <button className={`tab ${activeTab==='parcelas'?'active':''}`} onClick={()=>setActiveTab('parcelas')}>
+          📅 Parcelas Futuras {futureCount > 0 && <span style={{background:'var(--warning)',color:'#fff',fontSize:10,padding:'1px 6px',borderRadius:10,marginLeft:4,fontFamily:'DM Mono'}}>{futureCount}</span>}
+        </button>
         <button className={`tab ${activeTab==='people'?'active':''}`} onClick={()=>setActiveTab('people')}>👥 Gerenciar Parentes</button>
       </div>
 
@@ -1001,7 +1196,9 @@ function FamilyModule({ transactions, people, onDelete, month, onManagePeople })
                   <tbody>
                     {p.transactions.map(t=>(
                       <tr key={t.id}>
-                        <td><div style={{fontWeight:500}}>{t.description}</div></td>
+                        <td>
+                          <div style={{fontWeight:500}}>{t.description}</div>
+                        </td>
                         <td><span style={{fontSize:'12px',color:'var(--muted)'}}>{CATEGORY_ICONS[t.category]||'📝'} {t.category}</span></td>
                         <td style={{fontFamily:'DM Mono',fontSize:'12px'}}>{fmtDate(t.date)}</td>
                         <td style={{textAlign:'right'}}><span className="amount-neg">{fmt(t.amount)}</span></td>
@@ -1020,7 +1217,11 @@ function FamilyModule({ transactions, people, onDelete, month, onManagePeople })
       )}
 
       {activeTab === 'all' && (
-        <TransactionsTable transactions={filtered} people={people} onDelete={onDelete} title="Todos os Gastos de Parentes" showPerson />
+        <TransactionsTable transactions={filtered} people={people} onDelete={onDelete} onUpdate={onUpdate} title="Todos os Gastos de Parentes" showPerson />
+      )}
+
+      {activeTab === 'parcelas' && (
+        <ParcelasFuturas transactions={transactions} />
       )}
 
       {activeTab === 'people' && (
@@ -1094,7 +1295,7 @@ function PeopleManager({ people, onManagePeople }) {
 }
 
 // ==================== PERSONAL MODULE ====================
-function PersonalModule({ transactions, people, onDelete, month }) {
+function PersonalModule({ transactions, people, onDelete, onUpdate, month }) {
   const filtered = transactions.filter(t=>t.module==='personal' && t.month===month);
   const income = filtered.filter(t=>t.type==='income').reduce((s,t)=>s+t.amount,0);
   const expense = filtered.filter(t=>t.type==='expense').reduce((s,t)=>s+t.amount,0);
@@ -1114,7 +1315,7 @@ function PersonalModule({ transactions, people, onDelete, month }) {
       </div>
 
       <div className="two-col">
-        <TransactionsTable transactions={filtered} people={people} onDelete={onDelete} title="💳 Meus Gastos Pessoais" />
+        <TransactionsTable transactions={filtered} people={people} onDelete={onDelete} onUpdate={onUpdate} title="💳 Meus Gastos Pessoais" />
 
         <div className="section-card" style={{height:'fit-content'}}>
           <div className="section-header"><span className="section-title">📊 Por Categoria</span></div>
@@ -2614,8 +2815,21 @@ function App() {
   const handleSaveMemory = (mem) => setClassificationMemory(mem);
 
   const handleImportTransactions = (txList) => {
-    setTransactions(prev => [...prev, ...txList]);
-    notify(txList.length + ' lancamentos importados da fatura!');
+    // Check for duplicates before import
+    const dups = txList.filter(tx => findDuplicates(tx, transactions).length > 0);
+    let toImport = txList;
+    if (dups.length > 0) {
+      const msg = dups.length === 1
+        ? '⚠️ 1 lançamento parece duplicado: "' + dups[0].description + '"\n\nImportar mesmo assim?'
+        : '⚠️ ' + dups.length + ' lançamentos parecem duplicados.\n' + dups.slice(0,3).map(d=>'"'+d.description+'"').join('\n') + (dups.length>3?'\n...':'') + '\n\nImportar todos mesmo assim?';
+      if (!window.confirm(msg)) {
+        toImport = txList.filter(tx => findDuplicates(tx, transactions).length === 0);
+        if (!toImport.length) { notify('Importação cancelada — todos duplicados.', 'error'); return; }
+        notify(dups.length + ' duplicata(s) ignorada(s). Importando ' + toImport.length + ' novos.');
+      }
+    }
+    setTransactions(prev => [...prev, ...toImport]);
+    notify(toImport.length + ' lançamentos importados da fatura!');
     setView('family');
   };
 
@@ -2633,6 +2847,21 @@ function App() {
     if(!confirm('Excluir este lançamento?')) return;
     setTransactions(prev=>prev.filter(t=>t.id!==id));
     notify('Lançamento removido.', 'error');
+  };
+
+  const handleUpdate = (id, changes) => {
+    setTransactions(prev => prev.map(t => t.id===id ? {...t,...changes} : t));
+    notify('Lançamento atualizado!');
+  };
+
+  // Duplicate-aware save: checks before adding, returns {saved, duplicates}
+  const handleSaveWithDupCheck = (tx) => {
+    const dups = findDuplicates(tx, transactions);
+    if (dups.length > 0) {
+      const names = dups.map(d => d.description + ' — ' + fmt(d.amount)).join(', ');
+      if (!window.confirm('⚠️ Possível duplicata detectada!\n\nJá existe um lançamento similar este mês:\n' + names + '\n\nDeseja adicionar mesmo assim?')) return;
+    }
+    handleSave(tx);
   };
 
   const openAdd = (mod) => { setDefaultModule(mod); setShowAdd(true); };
@@ -2719,8 +2948,8 @@ function App() {
         </div>
 
         {view==='dashboard' && <Dashboard transactions={transactions} people={people} month={month} />}
-        {view==='family'    && <FamilyModule transactions={transactions} people={people} onDelete={handleDelete} month={month} onManagePeople={setPeople} />}
-        {view==='personal'  && <PersonalModule transactions={transactions} people={people} onDelete={handleDelete} month={month} />}
+        {view==='family'    && <FamilyModule transactions={transactions} people={people} onDelete={handleDelete} onUpdate={handleUpdate} month={month} onManagePeople={setPeople} />}
+        {view==='personal'  && <PersonalModule transactions={transactions} people={people} onDelete={handleDelete} onUpdate={handleUpdate} month={month} />}
         {view==='agency'    && <AgencyModule transactions={transactions} people={people} onDelete={handleDelete} month={month} />}
         {view==='reports'   && <Reports transactions={transactions} people={people} month={month} />}
         {view==='fatura'    && <FaturaImport people={people} onImportTransactions={handleImportTransactions} classificationMemory={classificationMemory} onSaveMemory={handleSaveMemory} />}
@@ -2732,7 +2961,7 @@ function App() {
       {showAdd && (
         <AddTransactionModal
           onClose={()=>setShowAdd(false)}
-          onSave={handleSave}
+          onSave={handleSaveWithDupCheck}
           people={people}
           defaultModule={defaultModule}
         />
