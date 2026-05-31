@@ -1750,9 +1750,18 @@ Regras:
       const clean = text.replace(/```json|```/g, '').trim();
       const parsed = JSON.parse(clean);
       const enriched = parsed.items.map(item => ({
-        ...item, id: uid(), type: 'expense', paymentMethod: 'Cartao de Credito',
-        status: 'paid', month: item.date ? item.date.slice(0,7) : nowMonth(),
-        cardLabel: cardName || '', approved: false,
+        ...item,
+        id: uid(),
+        type: item.type || 'expense',
+        paymentMethod: 'Cartao de Credito',
+        status: 'paid',
+        month: item.date ? item.date.slice(0,7) : nowMonth(),
+        cardName: cardName || '',
+        cardLabel: cardName || '',
+        module: item.module || 'personal',
+        personId: item.personId || null,
+        installment: item.installment || null,
+        approved: false,
       }));
       setItems(enriched); setStep('review');
     } catch(e) {
@@ -1775,7 +1784,23 @@ Regras:
       newMemory[key] = { module:it.module, personId:it.personId||null, personName:person?.name||null, category:it.category, updatedAt:new Date().toISOString() };
     });
     onSaveMemory(newMemory);
-    const toImport = approved.map(({approved,confidence,reason,cardLabel,installment,...tx}) => tx);
+    // Keep all fields but strip UI-only ones; preserve module, personId, installment etc.
+    const toImport = approved.map(it => ({
+      id: it.id,
+      description: it.description,
+      amount: it.amount,
+      date: it.date,
+      month: it.month || (it.date ? it.date.slice(0,7) : nowMonth()),
+      type: it.type || 'expense',
+      module: it.module || 'personal',
+      personId: it.personId || null,
+      category: it.category || 'Outro',
+      paymentMethod: it.paymentMethod || 'Cartao de Credito',
+      status: it.status || 'paid',
+      cardName: it.cardName || it.cardLabel || '',
+      installment: it.installment || null,
+      notes: it.notes || '',
+    }));
     onImportTransactions(toImport);
     setStep('done');
   };
@@ -2299,7 +2324,22 @@ function ColarFatura({ people, onImportTransactions, classificationMemory, onSav
       newMemory[key] = { module:it.module, personId:it.personId||null, personName:person?.name||null, category:it.category, updatedAt:new Date().toISOString() };
     });
     onSaveMemory(newMemory);
-    const final = toImport.map(({approved,confidence,reason,...tx})=>tx);
+    const final = toImport.map(it => ({
+      id: it.id,
+      description: it.description,
+      amount: it.amount,
+      date: it.date,
+      month: it.month || (it.date ? it.date.slice(0,7) : nowMonth()),
+      type: it.type || 'expense',
+      module: it.module || 'personal',
+      personId: it.personId || null,
+      category: it.category || 'Outro',
+      paymentMethod: it.paymentMethod || 'Cartao de Credito',
+      status: it.status || 'paid',
+      cardName: it.cardName || '',
+      installment: it.installment || null,
+      notes: it.notes || '',
+    }));
     onImportTransactions(final);
   };
 
@@ -2829,7 +2869,12 @@ function App() {
       }
     }
     setTransactions(prev => [...prev, ...toImport]);
-    notify(toImport.length + ' lançamentos importados da fatura!');
+    // Switch sidebar month to the most common month in the import
+    const monthCounts = {};
+    toImport.forEach(t => { monthCounts[t.month] = (monthCounts[t.month]||0) + 1; });
+    const dominantMonth = Object.entries(monthCounts).sort((a,b)=>b[1]-a[1])[0]?.[0];
+    if (dominantMonth) setMonth(dominantMonth);
+    notify(toImport.length + ' lançamentos importados!');
     setView('family');
   };
 
